@@ -1,0 +1,23 @@
+# ====================== LINUX SYSTEM MONITOR CONFIG ======================
+# Edit these values to your liking
+
+cpu_usage_threshold_percent: 90      # Alert if CPU usage stays above this %
+cpu_temp_threshold_c: 85             # Alert if CPU temp stays above this °C
+sustain_minutes: 5                   # How long the high condition must last before alerting
+check_interval_seconds: 60           # How often to check the system (60 = every minute)
+alert_cooldown_minutes: 30           # Minimum time between alerts (prevents spam)
+
+# === SELF-SAFEGUARDS (protects the daemon itself) ===
+self_max_cpu_percent: 20             # Daemon exits if it uses more than this CPU %
+self_max_mem_mb: 100                 # Daemon exits if it uses more than this RAM
+self_sustain_seconds: 120            # How long the daemon must be over its limits before exiting
+max_consecutive_errors: 5            # Exit after this many failed sensor reads in a row
+
+# How to call your send-report script.
+# The alert body is piped to stdin. Subject is appended as a trailing argument.
+# With ["send-report"] your existing alias reads everything from stdin — works as-is.
+send_report_cmd: ["send-report"]
+
+# Log file location — make sure this path is writable (or run with sudo)
+log_file: "/var/log/linux_system_monitor.log"
+# =========================================================================
