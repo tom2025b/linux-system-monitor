@@ -89,9 +89,9 @@ func loadConfig() {
 	}
 }
 
-// getMetrics samples CPU usage (averaged over 500ms) and the highest CPU-related
-// temperature from lm-sensors. Returns an error only if cpu.Percent fails;
-// temperature errors are non-fatal (temp just stays 0).
+// getMetrics samples CPU usage (averaged over 500ms) and the highest CPU
+// temperature from /sys/class/thermal. Returns an error only if cpu.Percent
+// fails; temperature errors are non-fatal (temp just stays 0).
 func getMetrics() (cpuUsage, cpuTempC float64, err error) {
 	// cpu.Percent with a 500ms interval blocks briefly then returns a single
 	// aggregate usage value across all cores (false = don't split per-core).
@@ -328,8 +328,9 @@ func main() {
 
 // ── Learning Notes ───────────────────────────────────────────────────────────
 // • gopsutil v3: Go library for cross-platform system stats (/proc on Linux).
-//   Sensors package only supports Temperatures(); fan speed requires custom
-//   lm-sensors parsing if needed.
+//   Used here for cpu.Percent and process self-monitoring only.
+//   Temperature is read directly from the kernel via /sys/class/thermal — no
+//   lm-sensors or extra dependencies required.
 // • context.WithCancel: the idiomatic way to propagate shutdown signals in Go.
 //   cancel() closes the ctx.Done() channel, unblocking any select that watches it.
 // • time.NewTicker vs time.Sleep: Ticker fires at fixed wall-clock intervals
