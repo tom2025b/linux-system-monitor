@@ -16,6 +16,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -56,7 +57,12 @@ var (
 	selfHighStart     time.Time // when daemon itself first went over its own limits
 	consecutiveErrors int       // how many metric reads have failed in a row
 	logger            *log.Logger
-	ownPID            int // this process's PID, used for self-monitoring
+	ownPID            int              // this process's PID, used for self-monitoring
+	selfProc          *process.Process // persistent handle for self CPU tracking
+
+	// thermalWarnOnce ensures the "no thermal zones" warning is only logged
+	// once — not repeated on every tick.
+	thermalWarnOnce sync.Once
 )
 
 // loadConfig reads and parses linux_system_monitor.yaml, applying safe defaults
@@ -89,6 +95,77 @@ func loadConfig() {
 	}
 }
 
+// validateConfig checks that all threshold values are in sensible ranges.
+// Called after loadConfig() so defaults have already been applied.
+// Logs every problem found before fatally exiting, so the user sees them all.
+func validateConfig() {
+	var errs []string
+
+	// CPU usage is a percentage — must be 1–100.
+	if cfg.CPUUsageThreshold <= 0 || cfg.CPUUsageThreshold > 100 {
+		errs = append(errs, "cpu_usage_threshold_percent must be between 1 and 100")
+	}
+	// 150°C is well above any real CPU's thermal limit — a safe upper bound.
+	if cfg.CPUTempThresholdC <= 0 || cfg.CPUTempThresholdC > 150 {
+		errs = append(errs, "cpu_temp_threshold_c must be between 1 and 150")
+	}
+	// A zero or negative sustain window would fire alerts instantly.
+	if cfg.SustainMinutes <= 0 {
+		errs = append(errs, "sustain_minutes must be > 0")
+	}
+	// A zero interval would spin the CPU reading metrics non-stop.
+	if cfg.CheckIntervalSeconds <= 0 {
+		errs = append(errs, "check_interval_seconds must be > 0")
+	}
+	// Cooldown of 0 is allowed (no suppression), but negative makes no sense.
+	if cfg.AlertCooldownMinutes < 0 {
+		errs = append(errs, "alert_cooldown_minutes must be >= 0")
+	}
+	// Self-safeguard limits must be positive.
+	if cfg.SelfMaxCPUPercent <= 0 {
+		errs = append(errs, "self_max_cpu_percent must be > 0")
+	}
+	if cfg.SelfMaxMemMB <= 0 {
+		errs = append(errs, "self_max_mem_mb must be > 0")
+	}
+	if cfg.SelfSustainSeconds <= 0 {
+		errs = append(errs, "self_sustain_seconds must be > 0")
+	}
+	if cfg.MaxConsecutiveErrors <= 0 {
+		errs = append(errs, "max_consecutive_errors must be > 0")
+	}
+
+	if len(errs) > 0 {
+		for _, e := range errs {
+			log.Printf("❌ Config error: %s", e)
+		}
+		log.Fatal("❌ Fix the config errors above and restart")
+	}
+}
+
+// checkLogDir ensures the log file's parent directory exists and is writable.
+// Called at startup before opening the log file, so failures produce a clear
+// error message rather than a cryptic "permission denied" mid-run.
+func checkLogDir() {
+	dir := filepath.Dir(cfg.LogFile)
+
+	// MkdirAll creates the directory (and any parents) if it doesn't exist.
+	// 0755 = owner rwx, group+other rx — standard for system directories.
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Fatalf("❌ Cannot create log directory %s: %v", dir, err)
+	}
+
+	// Probe writability by creating and immediately removing a temp file.
+	// This catches permission issues before we commit to running as a daemon.
+	probe := filepath.Join(dir, ".write_probe")
+	f, err := os.OpenFile(probe, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("❌ Log directory %s is not writable: %v", dir, err)
+	}
+	f.Close()
+	os.Remove(probe) // best-effort cleanup; ignore error
+}
+
 // getMetrics samples CPU usage (averaged over 500ms) and the highest CPU
 // temperature from /sys/class/thermal. Returns an error only if cpu.Percent
 // fails; temperature errors are non-fatal (temp just stays 0).
@@ -112,26 +189,19 @@ func getMetrics() (cpuUsage, cpuTempC float64, err error) {
 }
 
 // checkSelfResources returns this daemon's own CPU% and RSS memory usage.
-// Uses process.CPUPercent with a 500ms sample window for an accurate reading.
+// Uses the persistent selfProc handle so CPUPercent() measures the delta
+// since the previous call — no sleep required, no double-call overhead.
 func checkSelfResources() (cpuPct, memMB float64, err error) {
-	// NewProcess looks up our PID in /proc to get a handle on ourselves.
-	proc, err := process.NewProcess(int32(ownPID))
-	if err != nil {
-		return 0, 0, err
-	}
-
-	// CPUPercent in gopsutil v3 takes no interval argument — it computes CPU%
-	// since the last call for this process handle (or since process start on
-	// the first call). Call it twice with a short sleep for a fresh sample.
-	_, _ = proc.CPUPercent() // prime the baseline measurement
-	time.Sleep(500 * time.Millisecond)
-	cpuPct, err = proc.CPUPercent()
+	// CPUPercent() on a persistent handle measures CPU ticks elapsed since
+	// the last call to this same handle. The first call (done at startup)
+	// establishes the baseline; every subsequent call returns a real delta.
+	cpuPct, err = selfProc.CPUPercent()
 	if err != nil {
 		return 0, 0, err
 	}
 
 	// MemoryInfo returns RSS (resident set size) — actual RAM in use, not virtual.
-	mem, err := proc.MemoryInfo()
+	mem, err := selfProc.MemoryInfo()
 	if err != nil {
 		return 0, 0, err
 	}
@@ -143,13 +213,19 @@ func checkSelfResources() (cpuPct, memMB float64, err error) {
 // readMaxThermalTemp scans /sys/class/thermal/thermal_zone*/temp and returns
 // the highest temperature found, in degrees Celsius.
 // Each file holds an integer in millidegrees (e.g. "48000" = 48°C).
-// Returns 0 if no thermal zones are readable (e.g. inside a VM).
+// Logs a one-time warning if no thermal zones are found (e.g. inside a VM).
 func readMaxThermalTemp() float64 {
 	// Glob expands the wildcard to every thermal zone the kernel exposes.
 	zones, err := filepath.Glob("/sys/class/thermal/thermal_zone*/temp")
 	if err != nil || len(zones) == 0 {
+		// sync.Once ensures this warning appears exactly once in the log,
+		// not on every tick — avoids log spam on systems with no sensors.
+		thermalWarnOnce.Do(func() {
+			logger.Println("⚠️  No thermal zones found in /sys/class/thermal — temperature monitoring disabled (normal inside VMs)")
+		})
 		return 0
 	}
+
 	maxTemp := 0.0
 	for _, path := range zones {
 		data, err := os.ReadFile(path)
@@ -203,7 +279,12 @@ Log: %s
 
 func main() {
 	loadConfig()
+	validateConfig()
+
 	ownPID = os.Getpid()
+
+	// Verify the log directory exists and is writable before committing to run.
+	checkLogDir()
 
 	// Open (or create) the log file in append mode so history is preserved
 	// across restarts. 0644 = owner rw, group+other r.
@@ -216,6 +297,17 @@ func main() {
 	// log.New writes to logFile with a "MONITOR: " prefix and timestamp+file info.
 	logger = log.New(logFile, "MONITOR: ", log.LstdFlags|log.Lshortfile)
 	logger.Printf("🚀 Linux System Monitor started — PID %d", ownPID)
+
+	// Build a persistent process handle for self-monitoring.
+	// Keeping one handle across ticks lets CPUPercent() measure deltas correctly
+	// without needing a sleep or double-call each tick.
+	selfProc, err = process.NewProcess(int32(ownPID))
+	if err != nil {
+		log.Fatalf("❌ Cannot get self process handle: %v", err)
+	}
+	// Prime the baseline — first call always returns 0; subsequent calls return
+	// the real CPU% since this call. We discard the result intentionally.
+	_, _ = selfProc.CPUPercent()
 
 	// Deferred panic recovery: if anything unexpected panics, log it with a
 	// full stack trace before exiting. This prevents silent crashes.
@@ -331,6 +423,11 @@ func main() {
 //   Used here for cpu.Percent and process self-monitoring only.
 //   Temperature is read directly from the kernel via /sys/class/thermal — no
 //   lm-sensors or extra dependencies required.
+// • sync.Once: runs a function exactly once across all goroutines, no matter
+//   how many times it's called. Ideal for one-time warnings in a hot loop.
+// • Persistent process.Process handle: keeping one handle lets CPUPercent()
+//   accumulate a proper time delta between calls, giving accurate readings
+//   without a blocking sleep on every tick.
 // • context.WithCancel: the idiomatic way to propagate shutdown signals in Go.
 //   cancel() closes the ctx.Done() channel, unblocking any select that watches it.
 // • time.NewTicker vs time.Sleep: Ticker fires at fixed wall-clock intervals
