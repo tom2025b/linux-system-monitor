@@ -1,0 +1,47 @@
+# config.yaml — linux-system-monitor runtime configuration.
+# Mount read-only into the container at /config/config.yaml.
+#
+# Config path resolution order (first match wins):
+#   1. $MONITOR_CONFIG environment variable  — explicit override
+#   2. /config/config.yaml                   — default container mount point
+#   3. ./config.yaml                         — fallback for local development
+
+# ── System Thresholds ────────────────────────────────────────────────────────
+
+# Alert if CPU usage stays above this percentage for sustain_minutes.
+cpu_usage_threshold_percent: 90
+
+# Alert if CPU temperature stays above this Celsius value for sustain_minutes.
+# Only real CPU thermal zones are read (x86_pkg_temp, cpu-thermal, etc.).
+# Battery, NVMe, PCH, and other non-CPU zones are silently ignored.
+cpu_temp_threshold_c: 85
+
+# Both thresholds use OR logic: either one sustained alone triggers an alert.
+
+# How many consecutive minutes the high condition must last before alerting.
+sustain_minutes: 5
+
+# How often to poll the system, in seconds.
+check_interval_seconds: 60
+
+# Minimum minutes between alerts. Prevents spam during sustained high load.
+# Set to 0 to disable cooldown (not recommended).
+alert_cooldown_minutes: 30
+
+# ── Self-Safeguards ──────────────────────────────────────────────────────────
+# If this daemon exceeds its own resource limits for self_sustain_seconds
+# continuously, it exits cleanly so Podman's restart policy can bring it back.
+
+self_max_cpu_percent: 20
+self_max_mem_mb: 100
+self_sustain_seconds: 120
+max_consecutive_errors: 5
+
+# ── Paths (must match your --volume mounts) ──────────────────────────────────
+
+# Directory where the daemon writes alert .txt files.
+# entrypoint.sh watches this dir with inotifywait and delivers via send-report.
+alert_dir: /alerts
+
+# Log file path inside the container.
+log_file: /logs/monitor.log
